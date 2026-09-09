@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# verify — the release gate (LAW 28). Exits non-zero the moment the project is not
+# genuinely release-ready. Wire it into CI; the CI run is the authority (LAW 22).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${BUILD_PACK_ROOT:-$SCRIPT_DIR}"
+DOCS_DIR="${DOCS_DIR:-docs}"
+CONFIG_FILE="${VERIFY_CONFIG:-$ROOT/verify.config}"
+REQUIREMENTS="$ROOT/$DOCS_DIR/02-requirements.md"
+TRACE="$ROOT/$DOCS_DIR/07-traceability.md"
+TASKS="$ROOT/TASKS.md"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RED="$(printf '\033[31m')"; C_GREEN="$(printf '\033[32m')"
+  C_YEL="$(printf '\033[33m')"; C_BOLD="$(printf '\033[1m')"; C_OFF="$(printf '\033[0m')"
+else C_RED=""; C_GREEN=""; C_YEL=""; C_BOLD=""; C_OFF=""; fi
+
+FAILURES=0; WARNINGS=0; ROWS=()
+record() { case "$1" in
+  PASS)  ROWS+=("${C_GREEN}PASS${C_OFF}|$2|${3:-}") ;;
+  FAIL)  ROWS+=("${C_RED}FAIL${C_OFF}|$2|${3:-}"); FAILURES=$((FAILURES+1)) ;;
+  HUMAN) ROWS+=("${C_YEL}HUMAN-ONLY${C_OFF}|$2|${3:-}"); WARNINGS=$((WARNINGS+1)) ;;
+esac; }
+section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_OFF"; }
+
+BUILD_CMD=""; LINT_CMD=""; TYPECHECK_CMD=""; TEST_CMD=""
+COVERAGE_CMD=""; AUDIT_CMD=""; SECRET_SCAN_CMD=""
+if [ -f "$CONFIG_FILE" ]; then . "$CONFIG_FILE"
+else printf '%sverify.config not found at %s%s\n' "$C_RED" "$CONFIG_FILE" "$C_OFF" >&2
+  printf 'Copy verify.config.example to verify.config and fill in your commands.\n' >&2; exit 2; fi
+
+run_cmd() { local cmd="$1" label="$2"
+  if [ -z "$cmd" ]; then record FAIL "$label" "not configured in verify.config (set the command or NA:<reason>)"; return; fi
+  case "$cmd" in NA:*) record HUMAN "$label" "excluded: ${cmd#NA:}"; return ;; esac
+  printf '%s-- %s --%s  %s\n' "$C_BOLD" "$label" "$C_OFF" "$cmd"
+  local out rc; out="$(bash -c "$cmd" 2>&1)"; rc=$?; printf '%s\n' "$out" | tail -n 15
+  if [ "$rc" -eq 0 ]; then record PASS "$label" "exit 0"; else record FAIL "$label" "exit $rc"; fi
+}
+
+section "Doc-integrity checks"
+if [ ! -f "$REQUIREMENTS" ]; then record FAIL "MVP REQs present" "missing $REQUIREMENTS"
+elif [ ! -f "$TRACE" ]; then record FAIL "MVP REQs traced" "missing $TRACE"
+else
+  mvp_ids="$(grep -oE 'REQ-[0-9]+[[:space:]]*\[MVP\]' "$REQUIREMENTS" | grep -oE 'REQ-[0-9]+' | sort -u)"
+  if [ -z "$mvp_ids" ]; then record HUMAN "MVP REQs present" "no [MVP] REQs found — confirm intentional"
+  else missing=""
+    for id in $mvp_ids; do
+      status="$(awk -F'|' -v id="$id" '{ for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/,"",$i)} if($1==id)print $5 }' "$TRACE" | tail -n1)"
+      [ "$status" != "DONE" ] && missing="$missing $id(${status:-MISSING})"
+    done
+    if [ -n "$missing" ]; then record FAIL "MVP REQs DONE in traceability" "not DONE:$missing"
+    else record PASS "MVP REQs DONE in traceability" "$(echo "$mvp_ids" | wc -w | tr -d ' ') MVP REQ(s)"; fi
+  fi
+fi
+if [ -f "$TRACE" ]; then
+  no_test="$(awk -F'|' '/REQ-[0-9]/{ for(i=1;i<=NF;i++){gsub(/^[ \t]+|[ \t]+$/,"",$i)} if($5=="DONE" && ($4==""||$4=="-"||tolower($4)=="none"||tolower($4)=="tbd")) print $1 }' "$TRACE")"
+  if [ -n "$no_test" ]; then record FAIL "DONE REQs have a test" "DONE but no test: $(echo $no_test | tr '\n' ' ')"
+  else record PASS "DONE REQs have a test" "all DONE rows reference a test"; fi
+fi
+if [ ! -f "$TASKS" ]; then record HUMAN "No open P0/P1 tasks" "TASKS.md not found — confirm intentional"
+else
+  open_blocking="$(grep -nE '\[P[01]\]' "$TASKS" | grep -iE 'status:[[:space:]]*open' || true)"
+  if [ -n "$open_blocking" ]; then record FAIL "No open P0/P1 tasks" "$(printf '%s\n' "$open_blocking" | sed 's/^/    /') open blocking task(s)"
+  else record PASS "No open P0/P1 tasks" "none open"; fi
+fi
+
+section "Project command checks"
+run_cmd "$BUILD_CMD" "build"; run_cmd "$LINT_CMD" "lint"; run_cmd "$TYPECHECK_CMD" "typecheck"
+run_cmd "$TEST_CMD" "test (full suite)"; run_cmd "$COVERAGE_CMD" "coverage (06-test-plan.md target)"
+run_cmd "$AUDIT_CMD" "dependency audit (high/critical CVE)"; run_cmd "$SECRET_SCAN_CMD" "secret scan"
+
+section "Release gate summary"
+printf '%-12s | %-40s | %s\n' "STATUS" "CHECK" "DETAIL"
+printf -- '-------------+------------------------------------------+--------------------------\n'
+for row in "${ROWS[@]}"; do IFS='|' read -r st lbl det <<< "$row"; printf '%-12b | %-40s | %s\n' "$st" "$lbl" "$det"; done
+echo
+[ "$WARNINGS" -gt 0 ] && printf '%s%s HUMAN-ONLY row(s): reconcile each in RELEASE-GATE.md.%s\n' "$C_YEL" "$WARNINGS" "$C_OFF"
+if [ "$FAILURES" -eq 0 ]; then
+  printf '%s%sRELEASE GATE: PASS%s (automated subset). Now confirm the manual rows in RELEASE-GATE.md.\n' "$C_BOLD" "$C_GREEN" "$C_OFF"; exit 0
+else
+  printf '%s%sRELEASE GATE: REJECTED%s — %s failing check(s) above. Product is NOT DONE (LAW 28).\n' "$C_BOLD" "$C_RED" "$C_OFF" "$FAILURES"; exit 1
+fi
